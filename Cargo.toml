@@ -1,28 +1,40 @@
 [package]
 
 name = "gunship"
-version = "0.0.1"
+version = "0.1.0"
 authors = ["David LeGare <excaliburhissheath@gmail.com>"]
 
-[lib]
-name = "gunship"
+[features]
+timing = []
+no-draw = []
 
-[dependencies.bootstrap_rs]
-version = "*"
-path = "lib/bootstrap_rs"
+[dependencies]
+bootstrap_rs = { path = "lib/bootstrap_rs" }
+bootstrap_audio = { path = "lib/bootstrap_audio" }
+cell-extras = { git = "https://github.com/excaliburHisSheath/cell-extras" }
+fiber = { version = "0.1", path = "lib/fiber" }
+hash = { path = "lib/hash" }
+lazy_static = "0.2.1"
+parse_collada = { path = "lib/parse_collada" }
+parse-obj = { version = "0.1", path = "lib/parse-obj" }
+polygon = { path = "lib/polygon_rs" }
+polygon_math = { path = "lib/polygon_math" }
+stopwatch = { path = "lib/stopwatch" }
 
-[dependencies.bootstrap_audio]
-version = "*"
-path = "lib/bootstrap_audio"
+[dev_dependencies]
+rand = "*"
 
-[dependencies.parse_collada]
-version = "*"
-path = "lib/parse_collada"
+[profile.dev]
+panic = "abort"
 
-[dependencies.polygon_rs]
-version = "*"
-path = "lib/polygon_rs"
+[profile.release]
+panic = "abort"
 
-[dependencies.polygon_math]
-version = "*"
-path = "lib/polygon_math"
+[profile.test ]
+panic = "abort"
+
+[profile.bench]
+panic = "abort"
+
+[profile.doc]
+panic = "abort"

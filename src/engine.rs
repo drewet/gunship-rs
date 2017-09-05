@@ -1,330 +1,472 @@
-use std::rc::Rc;
-use std::cell::RefCell;
-use std::thread;
-use std::ops::Deref;
-use std::any::{Any, TypeId};
+use camera::CameraData;
+use mesh_renderer::MeshRendererData;
+use resource::{MaterialId, MeshId};
+use scheduler::{self, WorkId};
+use transform::{TransformInnerHandle, TransformGraph};
+use bootstrap::window::{Message, Window};
+use cell_extras::{AtomicInitCell, InitCell};
+use input::{self, Input, ScanCode};
+use light::LightInner;
+use polygon::{GpuMesh, Renderer, RendererBuilder};
+use polygon::anchor::Anchor;
+use polygon::camera::{Camera as RenderCamera, CameraId};
+use polygon::material::MaterialId as PolygonMaterialId;
+use polygon::mesh_instance::MeshInstance;
 use std::collections::HashMap;
-use std::intrinsics;
-use std::raw::TraitObject;
+use std::fs::File;
+use std::io::Write;
 use std::mem;
+use std::ptr::{self, Unique};
+use std::sync::{Arc, Barrier};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
+use std::thread;
+use stopwatch::{self, stats, PrettyDuration, Stopwatch};
 
-use bootstrap;
-use bootstrap::window::Window;
-use bootstrap::window::Message::*;
-use bootstrap::time::Timer;
-use bootstrap::gl_utils;
+#[derive(Debug)]
+pub struct EngineBuilder {
+    max_workers: usize,
+}
 
-use bs_audio;
+static INSTANCE: AtomicInitCell<Unique<Engine>> = AtomicInitCell::new();
+static MAIN_LOOP: AtomicInitCell<WorkId> = AtomicInitCell::new();
 
-use polygon::gl_render::{self, GLRender};
+/// A builder for configuring the components and systems registered with the game engine.
+///
+/// Component managers and systems cannot be changed once the engine has been instantiated so they
+/// must be provided all together when the instance is created. `EngineBuilder` provides an
+/// interface for gathering all managers and systems to be provided to the engine.
+impl EngineBuilder {
+    /// Creates a new `EngineBuilder` object.
+    pub fn new() -> EngineBuilder {
+        EngineBuilder {
+            max_workers: 1,
+        }
+    }
 
-use scene::Scene;
-use resource::ResourceManager;
-use ecs::System;
-use component::*;
+    /// Consumes the builder and creates the `Engine` instance.
+    ///
+    /// `func` is invoked once the engine has been setup, so `func` should kick off all game
+    /// functionality.
+    ///
+    /// No `Engine` object is returned because this method instantiates the engine singleton.
+    pub fn build<F>(self, func: F)
+        where F: FnOnce()
+    {
+        let _s = Stopwatch::new("Build engine");
 
-pub const TARGET_FRAME_TIME_SECONDS: f32 = 1.0 / 60.0;
-pub const TARGET_FRAME_TIME_MS: f32 = TARGET_FRAME_TIME_SECONDS * 1000.0;
+        let window = {
+            let mut window = unsafe { mem::uninitialized() };
+            let mut out = unsafe { Unique::new(&mut window as *mut _) };
+
+            let barrier = Arc::new(Barrier::new(2));
+            let barrier_clone = barrier.clone();
+
+            thread::spawn(move || {
+                let mut window = Window::new("gunship game").unwrap();
+
+                let mut message_pump = window.message_pump();
+
+                // write data out to `window` without dropping the old (uninitialized) value.
+                unsafe { ptr::write(out.get_mut(), window); }
+
+                // Sync with
+                barrier_clone.wait();
+
+                // We're done using the barrier, drop it so that the `Arc` can deallocate once
+                // the other thread has receieved the Window.
+                mem::drop(barrier_clone);
+
+                message_pump.run();
+            });
+
+            // Wait until window thread finishe creating the window.
+            barrier.wait();
+
+            window
+        };
+
+        // Setup renderer and default shared material.
+        let mut renderer = RendererBuilder::new(&window).build();
+
+        let mut material = renderer.default_material();
+        material.set_color("surface_color", ::math::Color::rgb(1.0, 0.0, 0.0));
+        material.set_color("surface_specular", ::math::Color::rgb(1.0, 1.0, 1.0));
+        material.set_f32("surface_shininess", 4.0);
+        let default_material_id = renderer.register_shared_material(material);
+
+
+        let (sender, receiever) = mpsc::channel();
+
+        // Init aysnc subsystem.
+        scheduler::init_thread();
+
+        // Spawn our worker threads.
+        if self.max_workers > 0 {
+            for _ in 0..self.max_workers - 1 {
+                let sender = sender.clone();
+                thread::spawn(move || {
+                    // Initialize thread-local renderer message channel.
+                    RENDER_MESSAGE_CHANNEL.with(move |channel| { channel.init(sender); });
+
+                    // Initialize worker thread to support fibers and wait for work to be available.
+                    scheduler::run_wait_fiber();
+                });
+            }
+        }
+
+        // Set the current thread's channel.
+        RENDER_MESSAGE_CHANNEL.with(move |channel| { channel.init(sender); });
+
+        let mut engine = Box::new(Engine {
+            window: window,
+            renderer: renderer,
+            channel: receiever,
+
+            mesh_map: HashMap::new(),
+
+            scene_graph: TransformGraph::new(),
+            lights: Vec::new(),
+            camera: None,
+            behaviors: Vec::new(),
+            input: Input::new(),
+
+            default_material_id: default_material_id,
+
+            debug_pause: false,
+        });
+
+        INSTANCE.init(unsafe { Unique::new(&mut *engine) });
+
+        {
+            let _s = Stopwatch::new("Scene setup");
+            func();
+        }
+
+        let main_loop = scheduler::start(move || { main_loop(engine); });
+
+        MAIN_LOOP.init(main_loop.work_id());
+
+        wait_for_quit();
+
+        // Time to shut down the engine.
+        let events_string = stopwatch::write_events_to_string();
+        let mut out_file = File::create("stopwatch.json").unwrap();
+        out_file.write_all(events_string.as_bytes()).unwrap();
+    }
+
+    pub fn max_workers(&mut self, workers: usize) -> &mut EngineBuilder {
+        assert!(workers > 0, "There must be at least one worker for the engine to run");
+        self.max_workers = workers;
+        self
+    }
+}
 
 pub struct Engine {
-    window: Rc<RefCell<Window>>, // TODO: This doesn't need to be an Rc<RefCell<>> when we're not doing hotloading.
-    renderer: GLRender,
-    resource_manager: Rc<RefCell<ResourceManager>>,
+    window: Window,
 
-    systems: Vec<Box<System>>,
-    system_indices: HashMap<TypeId, usize>,
-    system_names: HashMap<String, TypeId>,
+    renderer: Box<Renderer>,
+    channel: Receiver<EngineMessage>,
 
-    transform_update: Box<System>,
-    light_update: Box<System>,
-    audio_update: Box<System>,
-    scene: Scene,
+    mesh_map: HashMap<MeshId, GpuMesh>,
 
-    close: bool,
+    scene_graph: TransformGraph,
+    lights: Vec<LightInner>,
+    camera: Option<(Box<CameraData>, CameraId)>,
+    behaviors: Vec<Box<FnMut() + Send>>,
+    input: Input,
+
+    default_material_id: PolygonMaterialId,
+
+    debug_pause: bool,
 }
 
-impl Engine {
-    pub fn new() -> Engine {
-        let instance = bootstrap::init();
-        let window = Window::new("Rust Window", instance);
-        let renderer = gl_render::init(window.borrow().deref());
-        let resource_manager = Rc::new(RefCell::new(ResourceManager::new(renderer)));
-
-        let audio_source = match bs_audio::init() {
-            Ok(audio_source) => {
-                println!("Audio subsystem successfully initialized");
-                audio_source
-            },
-            Err(error) => {
-                panic!("Error while initialzing audio subsystem: {}", error)
-            },
-        };
-
-        Engine {
-            window: window.clone(),
-            renderer: renderer,
-            resource_manager: resource_manager.clone(),
-
-            systems: Vec::new(),
-            system_indices: HashMap::new(),
-            system_names: HashMap::new(),
-
-            transform_update: Box::new(TransformUpdateSystem),
-            light_update: Box::new(LightUpdateSystem),
-            audio_update: Box::new(AudioSystem),
-            scene: Scene::new(&resource_manager, audio_source),
-
-            close: false,
-        }
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // TODO: Clear instance?
     }
+}
 
-    pub fn update(&mut self) {
-        let scene = &mut self.scene;
+// `Engine` does handles synchronization internally, so it's meant be shared between threads.
+unsafe impl Send for Engine {}
+unsafe impl Sync for Engine {}
 
-        scene.input.clear();
-        let mut window = self.window.borrow_mut();
-        window.handle_messages();
-        loop {
-            let message = window.next_message(); // TODO: Make this an iterator to simplify this loop.
-            match message {
-                Some(message) => {
-                    match message {
-                        Activate => (),
-                        Close => self.close = true,
-                        Destroy => (),
-                        Paint => (),
+thread_local! {
+    // TODO: We don't want this to be completely public, only pub(crate), but `thread_local`
+    // doesn't support pub(crate) syntax.
+    pub static RENDER_MESSAGE_CHANNEL: InitCell<Sender<EngineMessage>> = InitCell::new();
+}
 
-                        // Handle inputs.
-                        KeyDown(_)
-                      | KeyUp(_)
-                      | MouseMove(_, _)
-                      | MousePos(_, _)
-                      | MouseButtonPressed(_)
-                      | MouseButtonReleased(_)
-                      | MouseWheel(_) => scene.input.push_input(message),
-                    }
-                },
-                None => break
-            }
-        }
+// TODO: This shouln't be public, it's for engine-internal use.
+pub fn scene_graph<F, T>(func: F) -> T
+    where F: FnOnce(&TransformGraph) -> T
+{
+    let engine = INSTANCE.borrow();
+    unsafe { func(&(***engine).scene_graph) }
+}
 
-        // Update systems.
-        for system in self.systems.iter_mut() {
-            system.update(scene, TARGET_FRAME_TIME_SECONDS);
-        }
+// TODO: This shouln't be public, it's for engine-internal use.
+pub fn input<F, T>(func: F) -> T
+    where F: FnOnce(&Input) -> T
+{
+    let engine = INSTANCE.borrow();
+    unsafe { func(&(***engine).input) }
+}
 
-        self.transform_update.update(scene, TARGET_FRAME_TIME_SECONDS);
-        self.light_update.update(scene, TARGET_FRAME_TIME_SECONDS);
-        self.audio_update.update(scene, TARGET_FRAME_TIME_SECONDS);
-    }
+// TODO: This shouln't be public, it's for engine-internal use.
+pub fn window<F, T>(func: F) -> T
+    where F: FnOnce(&Window) -> T
+{
+    let engine = INSTANCE.borrow();
+    unsafe { func(&(***engine).window) }
+}
 
-    pub fn draw(&mut self) {
-        self.renderer.clear();
+pub enum EngineMessage {
+    Anchor(TransformInnerHandle),
+    Camera(Box<CameraData>, TransformInnerHandle),
+    Light(LightInner),
+    Material(MaterialId, ::polygon::material::MaterialSource),
+    Mesh(MeshId, ::polygon::geometry::mesh::Mesh),
+    MeshInstance(Box<MeshRendererData>, TransformInnerHandle),
+    Behavior(Box<FnMut() + Send>),
+}
 
-        let scene = &mut self.scene;
-        let camera_manager = scene.get_manager::<CameraManager>();
-        let transform_manager = scene.get_manager::<TransformManager>();
-        let mesh_manager = scene.get_manager::<MeshManager>();
-        let light_manager = scene.get_manager::<LightManager>();
+pub fn send_message(message: EngineMessage) {
+    RENDER_MESSAGE_CHANNEL.with(move |channel| {
+        channel
+            .send(message)
+            .expect("Unable to send render resource message");
+    });
+}
 
-        // Handle rendering for each camera.
-        for (mut camera, entity) in camera_manager.iter_mut() {
+pub fn run_each_frame<F>(func: F)
+    where
+    F: 'static,
+    F: FnMut(),
+    F: Send,
+{
+    send_message(EngineMessage::Behavior(Box::new(func)));
+}
 
-            // TODO: Update the camera's bounds in a separate system.
+/// Suspends the calling worker until the engine main loop has finished.
+pub fn wait_for_quit() {
+    MAIN_LOOP.borrow().await();
+}
+
+fn main_loop(mut engine: Box<Engine>) {
+    // TODO: This should be a constant, but we can't create constant `Duration` objects right now.
+    let target_frame_time = Duration::new(0, 1_000_000_000 / 60);
+
+    let engine = &mut *engine;
+
+    let mut frame_times = Vec::with_capacity(10_000);
+
+    let start_time = Instant::now();
+    let mut frame_start = Instant::now();
+
+    'main: loop {
+        {
+            let _stopwatch = Stopwatch::with_budget("main loop", target_frame_time);
+
+            // Process any pending window messages.
             {
-                let transform = transform_manager.get(entity);
-
-                camera.position = transform.position_derived();
-                camera.rotation = transform.rotation_derived();
+                let _s = Stopwatch::new("Process window messages");
+                engine.input.clear();
+                for message in &mut engine.window {
+                    // TODO: Process input messages.
+                    match message {
+                        Message::Close => break 'main,
+                        Message::Activate => {}, // We don't handle window focus currently.
+                        _ => engine.input.push_input(message),
+                    }
+                }
             }
 
-            // Draw all of the meshes.
-            for (mesh, entity) in mesh_manager.iter() {
-                let transform = transform_manager.get(entity);
-
-                self.renderer.draw_mesh(
-                    &mesh,
-                    transform.derived_matrix(),
-                    transform.derived_normal_matrix(),
-                    &camera,
-                    &mut light_manager.components().iter().map(|ref_cell| *ref_cell.borrow()));
+            if input::key_pressed(ScanCode::F10) {
+                engine.debug_pause = !engine.debug_pause;
             }
+
+            let debug_step = input::key_pressed(ScanCode::F11);
+
+            // Kick off all game behaviors and wait for them to complete.
+            if engine.behaviors.len() > 0 && (!engine.debug_pause || debug_step) {
+                let _stopwatch = Stopwatch::new("game behaviors");
+                let mut pending = Vec::with_capacity(engine.behaviors.len());
+
+                // Start all behaviors...
+                for behavior in engine.behaviors.iter_mut() {
+                    let async = scheduler::start(&mut **behavior);
+                    pending.push(async);
+                }
+
+                // ... then wait for each of them to finish.
+                for async in pending {
+                    async.await();
+                }
+            } else {
+                let _s = Stopwatch::new("no game behaviors");
+                // There are no per-frame behaviors. We suspend the main loop fiber anyway to give
+                // other work some time on the thread. Generally this case only matters when debugging
+                // with a single thread.
+                scheduler::suspend();
+            }
+
+            // Before drawing, process any pending resource messages. These will be resources that were
+            // loaded but need to be registered with the renderer before the next draw.
+            {
+                let _s = Stopwatch::new("Process resource messages");
+                while let Ok(message) = engine.channel.try_recv() {
+                    match message {
+                        EngineMessage::Anchor(transform_inner) => {
+                            let _s = Stopwatch::new("Anchor message");
+                            let anchor = Anchor::new();
+                            let anchor_id = engine.renderer.register_anchor(anchor);
+
+                            transform_inner.set_anchor(anchor_id);
+                        },
+                        EngineMessage::Camera(camera_data, transform_inner) => {
+                            let _s = Stopwatch::new("Camera message");
+                            assert!(engine.camera.is_none(), "Can't add camera, one is already registered");
+
+                            let anchor_id = match transform_inner.anchor() {
+                                Some(anchor) => anchor,
+                                None => unimplemented!(), // TODO: Create the anchor.
+                            };
+
+                            let mut camera = RenderCamera::default();
+                            camera.set_anchor(anchor_id);
+                            let camera_id = engine.renderer.register_camera(camera);
+
+                            engine.camera = Some((camera_data, camera_id));
+                        },
+                        EngineMessage::Light(light_inner) => {
+                            let _s = Stopwatch::new("Light message");
+                            {
+                                let &(ref id, ref light) = &*light_inner;
+                                let light = light.borrow().clone();
+
+                                let light_id = engine.renderer.register_light(light);
+                                id.init(light_id);
+                            }
+
+                            engine.lights.push(light_inner);
+                        }
+                        EngineMessage::Material(_material_id, _material_source) => {
+                            // let _s = Stopwatch::new("Material message");
+                            // let material = engine.renderer.build_material(material_source).expect("TODO: Handle material compilation failure");
+                            // let _gpu_material = engine.renderer.register_material(material);
+                            //
+                            // // TODO: Create an association between `material_id` and `material_source`.
+                            unimplemented!();
+                        },
+                        EngineMessage::Mesh(mesh_id, mesh_data) => {
+                            let _s = Stopwatch::new("Mesh message");
+                            let gpu_mesh = engine.renderer.register_mesh(&mesh_data);
+                            let last = engine.mesh_map.insert(mesh_id, gpu_mesh);
+                            assert!(last.is_none(), "Duplicate mesh_id found: {:?}", mesh_id);
+                        },
+                        EngineMessage::MeshInstance(mesh_renderer_data, transform_inner) => {
+                            let _s = Stopwatch::new("Mesh instance message");
+                            let anchor_id = match transform_inner.anchor() {
+                                Some(anchor) => anchor,
+                                None => unimplemented!(), // TODO: Create the anchor.
+                            };
+
+                            let gpu_mesh = *engine
+                            .mesh_map
+                            .get(&mesh_renderer_data.mesh_id())
+                            .expect("No gpu mesh found for mesh id");
+
+                            let mut mesh_instance = MeshInstance::with_shared_material(
+                                gpu_mesh,
+                                engine.default_material_id,
+                            );
+
+                            mesh_instance.set_anchor(anchor_id);
+
+                            let _ = engine.renderer.register_mesh_instance(mesh_instance);
+                        }
+                        EngineMessage::Behavior(func) => {
+                            let _s = Stopwatch::new("Behavior message");
+                            engine.behaviors.push(func);
+                        }
+                    }
+                }
+            }
+
+            // Update renderer's anchors with flattened scene graph.
+            {
+                let _s = Stopwatch::new("Update renderer anchors");
+
+                for node in engine.scene_graph.roots() {
+                    let node = node.borrow();
+
+                    // TODO: Do something like pre-sorting so we only try to update out of
+                    // date nodes.
+                    if let Some(anchor_id) = node.anchor() {
+                        // Send position/rotation/scale to renderer anchor.
+                        let anchor = engine.renderer
+                        .get_anchor_mut(anchor_id)
+                        .expect("Node had anchor id but render did not have specified anchor");
+                        anchor.set_position(node.position);
+                        anchor.set_orientation(node.orientation);
+                        anchor.set_scale(node.scale);
+                    }
+                }
+            }
+
+            // Update the camera.
+            if let Some((ref camera_data, ref camera_id)) = engine.camera {
+                let _s = Stopwatch::new("Update renderer camera");
+
+                let render_camera = engine.renderer
+                    .get_camera_mut(*camera_id)
+                    .expect("Camera didn't exist for camera id");
+
+                render_camera.set_fov(camera_data.fov());
+                render_camera.set_aspect(camera_data.aspect());
+                render_camera.set_near(camera_data.near());
+                render_camera.set_far(camera_data.far());
+            }
+
+            // Update lights.
+            {
+                let _s = Stopwatch::new("Update renderer lights");
+
+                for light in &engine.lights {
+                    let &(ref id, ref data) = &**light;
+                    let light = engine.renderer.get_light_mut(*id.borrow()).expect("Renderer has no such light");
+                    *light = data.borrow().clone();
+                }
+            }
+
+            // Draw.
+            engine.renderer.draw();
         }
 
-        self.renderer.swap_buffers();
-    }
+        frame_times.push(frame_start.elapsed());
 
-    pub fn main_loop(&mut self) {
-        let timer = Timer::new();
+        // Determine the next frame's start time, dropping frames if we missed the frame time.
+        while frame_start < Instant::now() {
+            frame_start += target_frame_time;
+        }
 
-        loop {
-            let start_time = timer.now();
-
-            self.update();
-            self.draw();
-
-            if self.close {
-                break;
-            }
-
-            // Wait for target frame time.
-            let mut remaining_time_ms = TARGET_FRAME_TIME_MS - timer.elapsed_ms(start_time);
-            while remaining_time_ms > 1.0 {
-                thread::sleep_ms(remaining_time_ms as u32);
-                remaining_time_ms = TARGET_FRAME_TIME_MS - timer.elapsed_ms(start_time);
-            }
-
-            while remaining_time_ms > 0.0 {
-                remaining_time_ms = TARGET_FRAME_TIME_MS - timer.elapsed_ms(start_time);
-            }
-
-            // TODO: Don't flip buffers until end of frame time?
-        };
-    }
-
-    pub fn register_system<T: Any + System>(&mut self, system: T) {
-        let system_id = TypeId::of::<T>();
-        assert!(!self.system_indices.contains_key(&system_id),
-                "System {} with ID {:?} already registered", type_name::<T>(), system_id);
-
-        let index = self.systems.len();
-        self.systems.push(Box::new(system));
-        self.system_indices.insert(system_id, index);
-        self.system_names.insert(type_name::<T>().into(), system_id);
-    }
-
-    pub fn get_system<T: Any + System>(&self) -> &T {
-        let system_id = TypeId::of::<T>();
-        let index =
-            *self.system_indices.get(&system_id)
-            .expect(&format!("Trying to retrive system {} but no index found", type_name::<T>()));
-        let system = &*self.systems[index];
-
-        unsafe {
-            // Get the raw representation of the trait object.
-            let to: TraitObject = mem::transmute(system);
-
-            // Extract the data pointer.
-            mem::transmute(to.data)
+        // Now wait until we've returned to the frame cadence before beginning the next frame.
+        while Instant::now() < frame_start {
+            thread::sleep(Duration::new(0, 0));
         }
     }
 
-    pub fn get_system_by_name<T: Any + System>(&self) -> &T {
-        let system_id = self.system_names.get(type_name::<T>()).unwrap();
-        let index =
-            *self.system_indices.get(system_id)
-            .expect(&format!("Trying to retrive system {} but no index found", type_name::<T>()));
-        let system = &*self.systems[index];
+    // Print performance statistics.
+    // ============================================================================================
+    let run_duration = start_time.elapsed();
+    let stats = stats::analyze(&*frame_times, target_frame_time);
 
-        unsafe {
-            // Get the raw representation of the trait object.
-            let to: TraitObject = mem::transmute(system);
-
-            // Extract the data pointer.
-            mem::transmute(to.data)
-        }
-    }
-
-    pub fn scene(&self) -> &Scene {
-        &self.scene
-    }
-
-    pub fn scene_mut(&mut self) -> &mut Scene {
-        &mut self.scene
-    }
-
-    pub fn close(&self) -> bool {
-        self.close
-    }
-}
-
-impl Clone for Engine {
-    fn clone(&self) -> Engine {
-        let resource_manager = Rc::new(RefCell::new(self.resource_manager.borrow().deref().clone()));
-
-        let engine = Engine {
-            window: self.window.clone(),
-            renderer: self.renderer.clone(),
-            resource_manager: resource_manager.clone(),
-
-            systems: Vec::new(),
-            system_indices: HashMap::new(),
-            system_names: HashMap::new(),
-
-            transform_update: Box::new(TransformUpdateSystem),
-            light_update: Box::new(LightUpdateSystem),
-            audio_update: Box::new(AudioSystem),
-            scene: self.scene.clone(&resource_manager),
-
-            close: false,
-        };
-
-        engine
-    }
-}
-
-fn type_name<T>() -> &'static str {
-    unsafe {
-        intrinsics::type_name::<T>()
-    }
-}
-
-#[no_mangle]
-pub fn engine_init(window: Rc<RefCell<Window>>) -> Box<Engine> {
-    let renderer = gl_render::init(window.borrow().deref());
-    let resource_manager = Rc::new(RefCell::new(ResourceManager::new(renderer)));
-
-    let audio_source = match bs_audio::init() {
-        Ok(audio_source) => {
-            println!("Audio subsystem successfully initialized");
-            audio_source
-        },
-        Err(error) => {
-            panic!("Error while initialzing audio subsystem: {}", error)
-        },
-    };
-
-    Box::new(Engine {
-        window: window,
-        renderer: renderer,
-        resource_manager: resource_manager.clone(),
-
-        systems: Vec::new(),
-        system_indices: HashMap::new(),
-        system_names: HashMap::new(),
-
-        transform_update: Box::new(TransformUpdateSystem),
-        light_update: Box::new(LightUpdateSystem),
-        audio_update: Box::new(AudioSystem),
-        scene: Scene::new(&resource_manager, audio_source),
-
-        close: false,
-    })
-}
-
-#[no_mangle]
-pub fn engine_reload(engine: &Engine) -> Box<Engine> {
-    let new_engine = engine.clone();
-
-    // The proc loader needs to be set from within the DLL otherwise we don't
-    // correctly bind to OpenGL on Windows.
-    gl_utils::set_proc_loader();
-
-    Box::new(new_engine)
-}
-
-#[no_mangle]
-pub fn engine_update_and_render(engine: &mut Engine) {
-    engine.update();
-    engine.draw();
-}
-
-#[no_mangle]
-pub fn engine_close(engine: &Engine) -> bool {
-    engine.close()
-}
-
-#[no_mangle]
-pub fn engine_drop(engine: Box<Engine>) {
-    drop(engine);
+    println!("Performance statistics:");
+    println!("  Duration: {} ({} frames)", PrettyDuration(run_duration), frame_times.len());
+    println!("  Min: {}", PrettyDuration(stats.min));
+    println!("  Max: {}", PrettyDuration(stats.max));
+    println!("  Mean: {}", PrettyDuration(stats.mean));
+    println!("  Std: {}", PrettyDuration(stats.std));
+    println!("  Long frames: {} ({:.2}%)", stats.long_frames, stats.long_frame_ratio * 100.0);
 }

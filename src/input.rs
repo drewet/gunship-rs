@@ -1,10 +1,26 @@
 use std::collections::HashSet;
 
+use bootstrap;
 use bootstrap::window::Message;
 use bootstrap::window::Message::*;
+use engine;
+
 pub use bootstrap::input::ScanCode;
 
 pub const MAX_SUPPORTED_MOUSE_BUTTONS: usize = 5;
+
+pub fn set_cursor(visible: bool) {
+    bootstrap::input::set_cursor_visibility(visible);
+}
+
+pub fn set_capture(capture: bool) {
+    if capture {
+        let (top, left, bottom, right) = engine::window(|window| window.get_rect());
+        bootstrap::input::set_cursor_bounds(top, left, bottom, right);
+    } else {
+        bootstrap::input::clear_cursor_bounds();
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Input {
@@ -16,7 +32,7 @@ pub struct Input {
     mouse_down: [bool; MAX_SUPPORTED_MOUSE_BUTTONS],
     mouse_pressed: [bool; MAX_SUPPORTED_MOUSE_BUTTONS],
     mouse_released: [bool; MAX_SUPPORTED_MOUSE_BUTTONS],
-    mouse_scroll: u32,
+    mouse_scroll: i32,
 }
 
 impl Input {
@@ -25,7 +41,7 @@ impl Input {
             keys_pressed: HashSet::new(),
             keys_released: HashSet::new(),
             keys_down: HashSet::new(),
-            mouse_pos: (400, 400),
+            mouse_pos: (400, 400), // TODO: What's up with this hard-coded garbage???
             mouse_delta: (0, 0),
             mouse_down: [false; MAX_SUPPORTED_MOUSE_BUTTONS],
             mouse_pressed: [false; MAX_SUPPORTED_MOUSE_BUTTONS],
@@ -46,7 +62,9 @@ impl Input {
     pub fn push_input(&mut self, message: Message) {
         match message {
             KeyDown(key) => {
-                self.keys_pressed.insert(key);
+                if !self.key_down(key) {
+                    self.keys_pressed.insert(key);
+                }
                 self.keys_down.insert(key);
             },
             KeyUp(key) => {
@@ -74,51 +92,55 @@ impl Input {
                 self.mouse_down[index] = true;
             },
             MouseWheel(scroll_amount) => {
-                self.mouse_scroll += scroll_amount;
+                self.mouse_scroll = scroll_amount;
             }
-            _ => panic!("Unhandled message {:?} passed to Input::push_input()", message)
+            _ => panic!("Unhandled message {:?} passed to Input::push_input()", message) // TODO: Don't panic? Should be unreachable in release.
         }
     }
 
-    pub fn key_down(&self, key: ScanCode) -> bool {
+    fn key_down(&self, key: ScanCode) -> bool {
         self.keys_down.contains(&key)
     }
+}
 
-    pub fn key_pressed(&self, key: ScanCode) -> bool {
-        self.keys_pressed.contains(&key)
-    }
+pub fn key_down(key: ScanCode) -> bool {
+    engine::input(|input| input.keys_down.contains(&key))
+}
 
-    pub fn key_released(&self, key: ScanCode) -> bool {
-        self.keys_released.contains(&key)
-    }
+pub fn key_pressed(key: ScanCode) -> bool {
+    engine::input(|input| input.keys_pressed.contains(&key))
+}
 
-    pub fn mouse_pos(&self) -> (i32, i32) {
-        self.mouse_pos
-    }
+pub fn key_released(key: ScanCode) -> bool {
+    engine::input(|input| input.keys_released.contains(&key))
+}
 
-    pub fn mouse_delta(&self) -> (i32, i32) {
-        self.mouse_delta
-    }
+pub fn mouse_pos() -> (i32, i32) {
+    engine::input(|input| input.mouse_pos)
+}
 
-    pub fn mouse_button_down(&self, button: usize) -> bool {
-        assert!(button < MAX_SUPPORTED_MOUSE_BUTTONS);
+pub fn mouse_delta() -> (i32, i32) {
+    engine::input(|input| input.mouse_delta)
+}
 
-        self.mouse_down[button]
-    }
+pub fn mouse_button_down(button: usize) -> bool {
+    assert!(button < MAX_SUPPORTED_MOUSE_BUTTONS);
 
-    pub fn mouse_button_pressed(&self, button: usize) -> bool {
-        assert!(button < MAX_SUPPORTED_MOUSE_BUTTONS);
+    engine::input(|input| input.mouse_down[button])
+}
 
-        self.mouse_pressed[button]
-    }
+pub fn mouse_button_pressed(button: usize) -> bool {
+    assert!(button < MAX_SUPPORTED_MOUSE_BUTTONS);
 
-    pub fn mouse_button_released(&self, button: usize) -> bool {
-        assert!(button < MAX_SUPPORTED_MOUSE_BUTTONS);
+    engine::input(|input| input.mouse_pressed[button])
+}
 
-        self.mouse_released[button]
-    }
+pub fn mouse_button_released(button: usize) -> bool {
+    assert!(button < MAX_SUPPORTED_MOUSE_BUTTONS);
 
-    pub fn mouse_scroll(&self) -> u32 {
-        self.mouse_scroll
-    }
+    engine::input(|input| input.mouse_released[button])
+}
+
+pub fn mouse_scroll() -> i32 {
+    engine::input(|input| input.mouse_scroll)
 }

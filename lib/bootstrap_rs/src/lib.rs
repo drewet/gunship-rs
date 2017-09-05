@@ -1,20 +1,28 @@
-#![feature(str_utf16)] // TODO: Only used by windows currently, but has to be specified at root level.
+// Almost certainly going to be stabilized as-is, unlikely to break anything.
+#![feature(const_fn)]
 
-extern crate gl;
+// The scheduler puts a `Condvar` and `Mutex` into some statics.
+#![feature(drop_types_in_const)]
 
-#[cfg(windows)]
-pub mod windows;
+extern crate cell_extras;
 
-#[cfg(windows)]
-pub use windows::init::init;
+// This `extern_crate` should be within the macos platform module, but `macro_use` only works at
+// the root of the crate.
+#[cfg(target_os = "macos")]
+#[macro_use]
+extern crate objc;
 
-#[cfg(unix)]
-pub mod linux;
+#[cfg(target_os = "windows")]
+#[path="windows/mod.rs"]
+pub mod platform;
 
-#[cfg(unix)]
-pub use linux::init::init;
+#[cfg(target_os = "linux")]
+#[path="linux/mod.rs"]
+pub mod platform;
+
+#[cfg(target_os = "macos")]
+#[path="macos/mod.rs"]
+pub mod platform;
 
 pub mod window;
-pub mod gl_utils;
 pub mod input;
-pub mod time;
